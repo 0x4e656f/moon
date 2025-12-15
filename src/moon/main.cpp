@@ -5,6 +5,7 @@
 #include "server.h"
 #include "services/lua_service.h"
 #include <csignal>
+#include "cli.h"
 
 static std::weak_ptr<moon::server> wk_server;
 
@@ -110,6 +111,16 @@ int main(int argc, char* argv[]) {
     using namespace moon;
 
     int exitcode = -1;
+
+#if TARGET_PLATFORM == PLATFORM_WINDOWS
+
+    _putenv_s("TZ", "UTC");
+    _tzset();
+#else 
+	
+	setenv("TZ", "UTC", 1);
+    tzset();
+#endif
 
     time::timezone();
 
@@ -271,7 +282,15 @@ int main(int argc, char* argv[]) {
         server_->new_service(std::move(conf));
         server_->set_unique_service("bootstrap", BOOTSTRAP_ADDR);
 
+        //---------MX----------
+        auto c = new cli();
+        auto gsName = moon::format("%s-%s", argv[2], argv[3]);
+        c->Init(server_.get(), gsName.c_str());
+        //---------MX----------
+
         exitcode = server_->run();
+        delete c;
+
     } catch (const std::exception& e) {
         if (!log::instance().is_ready()) {
             log::instance().init("");
@@ -284,6 +303,7 @@ int main(int argc, char* argv[]) {
         thread_sleep(10);
     print_mem_stats();
     log::instance().wait();
+    std::cout << "\n----------Server Stoped!----------\n";
     return exitcode;
 }
 
@@ -342,5 +362,6 @@ void open_custom_libs(lua_State* L) {
     REGISTER_CUSTOM_LIBRARY("schema", luaopen_schema);
     REGISTER_CUSTOM_LIBRARY("fmt", luaopen_fmt);
     REGISTER_CUSTOM_LIBRARY("crypto.scram", luaopen_crypto_scram);
+    REGISTER_CUSTOM_LIBRARY("fastlz", luaopen_fastlz);
 }
 }

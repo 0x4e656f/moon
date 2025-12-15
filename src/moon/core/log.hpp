@@ -204,7 +204,7 @@ private:
                         break;
                     case LogLevel::Info:
                         stream = &std::cout;
-                        *stream << termcolor::white;
+                        *stream << termcolor::green;
                         break;
                     case LogLevel::Debug:
                         stream = &std::cout;
@@ -213,16 +213,21 @@ private:
                     default:
                         break;
                 }
-                if (stream != nullptr) {
-                    *stream << str << termcolor::white;
-                    if (str.back() != '\n')
+                if (stream != nullptr)
+                {
+                    if (str.back() != '>')
+                        *stream << str << termcolor::white;
+                    else
+                        *stream << str << termcolor::green;
+                    if (str.back() != '>' && str.back() != '\n')
                         *stream << '\n';
                 }
             }
 
-            if (fp_) {
+            if (fp_)
+            {
                 std::fwrite(str.data(), str.size(), 1, fp_.get());
-                if (str.back() != '\n')
+                if (str.back() != '>' && str.back() != '\n')
                     std::fputc('\n', fp_.get());
                 if (level <= LogLevel::Error) {
                     std::cout << std::endl;
