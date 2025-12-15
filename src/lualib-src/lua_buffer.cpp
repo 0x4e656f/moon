@@ -97,6 +97,12 @@ static int unpack(lua_State* L) {
                 case 'I':
                     push_integer<uint32_t>(L, start, end, little);
                     break;
+                case 'q':
+                    push_integer<int64_t>(L, start, end, little);
+                    break;
+                case 'Q':
+                    push_integer<uint64_t>(L, start, end, little);
+                    break;
                 case 'C':
                     lua_pushlightuserdata(L, (void*)start);
                     lua_pushinteger(L, end - start);

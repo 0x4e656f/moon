@@ -4,7 +4,7 @@
 #include <type_traits>
 
 //define system endian
-#define MOON_LITTLEENDIAN
+//#define MOON_LITTLEENDIAN
 
 namespace moon {
 template<typename T>
