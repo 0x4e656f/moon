@@ -363,5 +363,6 @@ void open_custom_libs(lua_State* L) {
     REGISTER_CUSTOM_LIBRARY("fmt", luaopen_fmt);
     REGISTER_CUSTOM_LIBRARY("crypto.scram", luaopen_crypto_scram);
     REGISTER_CUSTOM_LIBRARY("fastlz", luaopen_fastlz);
+    REGISTER_CUSTOM_LIBRARY("librsync", luaopen_librsync);
 }
 }

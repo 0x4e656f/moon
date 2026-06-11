@@ -25,4 +25,7 @@ ext/
 clib/
 lualib/ext/
 example/ext/
-
+_build_win_Release
+_build_win_Debug
+_build_linux_Release
+_build_linux_Debug

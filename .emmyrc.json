@@ -1,0 +1,77 @@
+{
+    "completion": {
+      "enable": true,
+      "autoRequire": false,
+      "autoRequireFunction": "require",
+      "autoRequireNamingConvention": "keep",
+      "callSnippet": false,
+      "postfix": "@"
+    },
+    "signature": {
+      "detailSignatureHelper": false
+    },
+    "diagnostics": {
+      "enable": true,
+      "disable": [
+        "param-type-mismatch",
+        "await-in-sync",
+        "need-check-nil",
+        "undefined-field",
+        "unnecessary-if",
+        "global-in-non-module"
+      ],
+      "globals": ["typeof", "xlua"],
+      "globalsRegex": [],
+      "severity": {
+      },
+      "enables": [
+      ]
+    },
+    "hint": {
+      "enable": false,
+      "paramHint": false,
+      "indexHint": false,
+      "localHint": false,
+      "overrideHint": false
+    },
+    "runtime": {
+      "version": "Lua5.4",
+      "requireLikeFunction": [],
+      "frameworkVersions": [],
+      "extensions": [".lua", ".lua.txt"],
+      "requirePattern": ["?.lua"]
+    },
+    "workspace": {
+      "ignoreDir": [
+  
+      ],
+      "ignoreGlobs": [
+      ],
+      "library": [
+        "G:\\Git\\magic-tower2\\Client\\Assets\\.API"
+      ],
+      "workspaceRoots": [],
+      "encoding": "",
+      "moduleMap": []
+    },
+    "resource": {
+      "paths": [
+        
+      ]
+    },
+    "codeLens": {
+      "enable": true
+    },
+    "strict": {
+      "requirePath": false,
+      "typeCall": true
+    },
+    "hover": {
+      "enable": true
+    },
+    "references": {
+      "enable": true,
+      "fuzzy_search": true
+    }
+  }
+  

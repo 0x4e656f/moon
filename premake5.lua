@@ -1,5 +1,7 @@
 ---@diagnostic disable: undefined-global, undefined-field, need-check-nil
-
+---package.cpath = package.cpath .. ';' .. os.getcwd() .. "/?.dll"
+---local dbg = require('emmy_core')
+---pcall(dbg.tcpConnect, '127.0.0.1', 9977)
 -- Global command-line option to specify release configuration
 newoption {
    trigger     = "release",
@@ -287,7 +289,8 @@ project "moon"
         "./src/moon/core",
         "./third",
         "./third/lua",
-        "./third/mimalloc/include"
+        "./third/mimalloc/include",
+		"./third/librsync-2.3.4/src"
     }
 
     files {
@@ -296,6 +299,7 @@ project "moon"
         "./src/moon/**.cpp"
     }
 
+    libdirs { "./target/release" }
     links{
         "lua",
         "lualib",
@@ -304,13 +308,15 @@ project "moon"
         "sharetable",
         "mongo",
         "mimalloc",
-        "lfmt"
+        "lfmt",
+		"rsync"
     }
 
     defines {
         "ASIO_STANDALONE" ,
         "ASIO_NO_DEPRECATED",
-        "MOON_ENABLE_MIMALLOC"
+        "MOON_ENABLE_MIMALLOC",
+		"LIBRSYNC_STATIC_DEFINE"
     }
 
     filter { "system:windows" }
@@ -459,7 +465,8 @@ add_lua_module(
             defines {
                 "ASIO_STANDALONE" ,
                 "ASIO_NO_DEPRECATED",
-                "MOON_ENABLE_MIMALLOC"
+                "MOON_ENABLE_MIMALLOC",
+				"LIBRSYNC_STATIC_DEFINE"
             }
 
             ---json
@@ -473,7 +480,8 @@ add_lua_module(
                 "./third/recastnavigation/Detour/Include",
                 "./third/recastnavigation/DetourCrowd/Include",
                 "./third/recastnavigation/DetourTileCache/Include",
-                "./third/recastnavigation/Recast/Include"
+                "./third/recastnavigation/Recast/Include",
+				"./third/librsync-2.3.4/src",
             }
 
             files {
