@@ -323,13 +323,14 @@ inline std::string escape_print(std::string_view input) {
     static constexpr std::string_view hex = "0123456789abcdef";
     std::string res;
     for (char ch: input) {
-        if (isprint(static_cast<unsigned char>(ch))) {
+        auto c = static_cast<unsigned char>(ch);
+        if (std::isprint(c)) {
             res.push_back(ch);
         } else {
             res.push_back('\\');
             res.push_back('x');
-            res.push_back(hex[ch >> 4]);
-            res.push_back(hex[ch & 0xf]);
+            res.push_back(hex[c >> 4]);
+            res.push_back(hex[c & 0x0f]);
         }
     }
     return res;
