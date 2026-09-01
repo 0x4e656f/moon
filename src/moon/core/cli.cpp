@@ -19,10 +19,15 @@ cli::~cli()
 {
     running_ = false;
     if (cliThread_) {
-        //if (cliThread_->joinable()) {
-        //    cliThread_->join();
-        //}
-        //delete cliThread_;
+#if TARGET_PLATFORM == PLATFORM_WINDOWS
+        // Wake a CLI thread that is blocked in std::getline so it can observe
+        // running_ and exit before this object is destroyed.
+        CancelSynchronousIo(cliThread_->native_handle());
+        if (cliThread_->joinable()) {
+            cliThread_->join();
+        }
+        delete cliThread_;
+#endif
         cliThread_ = nullptr;
     }
 
@@ -225,13 +230,24 @@ void cli::CLIThread_()
 
         if (!std::getline(std::cin, line))
         {
-            // 输入流被关闭，保留循环但避免挂死
-            auto warn = MakeLogBuffer_();
-            warn.write_back("[warning] 标准输入读取失败，可能是 Ctrl+D");
-            moon::log::instance().push_line(std::move(warn));
+            if (!running_)
+                break;
 
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            continue;
+#if TARGET_PLATFORM == PLATFORM_WINDOWS
+            // Some terminal hosts interrupt ReadConsole on Ctrl+C without
+            // delivering CTRL_C_EVENT to ConsoleHandlerRoutine. Treat a
+            // failed read from an interactive console as the same request.
+            DWORD mode = 0;
+            HANDLE stdIn = GetStdHandle(STD_INPUT_HANDLE);
+            if (stdIn != nullptr && stdIn != INVALID_HANDLE_VALUE &&
+                GetConsoleMode(stdIn, &mode)) {
+                server_->stop(CTRL_C_EVENT);
+            }
+#endif
+
+            // Stream failure flags are sticky. Retrying here would only print
+            // the same warning forever, so permanently stop the CLI reader.
+            break;
         }
 
         if (!line.empty())
