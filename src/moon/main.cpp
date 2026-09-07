@@ -114,8 +114,8 @@ int main(int argc, char* argv[]) {
 
 #if TARGET_PLATFORM == PLATFORM_WINDOWS
 
-    _putenv_s("TZ", "UTC");
-    _tzset();
+    //_putenv_s("TZ", "UTC");
+    //_tzset();
 #else 
 	
 	setenv("TZ", "UTC", 1);
