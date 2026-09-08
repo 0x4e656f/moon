@@ -1,5 +1,12 @@
---- SQLx driver 服务入口：连接池、业务 key 路由、FIFO 执行和关闭。
---- 客户端 API 与公开类型位于 lualib/lrust_sqldriver/client.lua。
+--- SQLx driver 独立服务入口；通过 moon.new_service 的 file="lrust_sqldriver.lua" 启动。
+--- 本文件只负责服务生命周期、连接池、路由和队列；业务 API 使用 require("lrust_sqldriver.client")。
+--- 每条 lane 是独立 SQLx 连接加 Lua FIFO 队列；每条最多处理一个请求，多条可以并行等待数据库。
+--- 固定业务 key 按哈希映射到 lane；只保证已接收请求在该 lane 内的先后，不等于多次调用的事务。
+--- 即使客户端不等待，服务端仍等待本次 SQLx 调用完成后才推进同一 lane，保证顺序。
+--- max_queue 限制本服务每条 lane 的等待加当前请求数；queue_capacity 是另一层的 Rust 队列容量。
+--- 连接失败不会重放当前 SQL；SOCKET/TIMEOUT/CLOSED 后清理连接，下一条请求再尝试建立。
+--- 服务实例应使用不同 conf.name，避免相同底层连接名互相替换；不要从外部关闭或使用 lane 连接。
+--- 公开配置/返回类型定义在客户端模块中，本服务无需 require 客户端来执行。
 ---@type LrustSqlDriverConfig
 local conf = ...
 
@@ -34,12 +41,13 @@ local moon = require("moon")
 ---@class LrustSqlDriverLane
 ---@field index integer lane 索引，从 1 开始。
 ---@field queue LrustSqlDriverQueue
----@field running boolean
----@field inflight boolean
----@field db? SqlX
----@field connection_name string
+---@field running boolean 工作协程是否已启动，用于避免一条 lane 启动多个消费者。
+---@field inflight boolean 是否正在处理一个请求，包含其连接建立、执行和必要清理。
+---@field db? SqlX 当前连接对象；惰性连接未建立或故障清理后为 nil。
+---@field connection_name string lane 专属进程内连接名，由服务名和 lane 索引组成。
 
--- 即使绕过客户端直接发送消息，也必须校验事务序列。
+--- 校验事务外层列表是从 1 开始的无空洞序列，返回语句数；空列表合法。
+--- 服务端独立校验，不信任客户端已做过检查；非法输入抛错，由入队阶段转换成 INVALID。
 ---@param queries SqlXStatement[]|LrustSqlDriverStatement[]
 ---@return integer count
 local function transaction_length(queries)
@@ -61,6 +69,7 @@ local tpack = table.pack
 local tunpack = table.unpack
 local traceback = debug.traceback
 
+-- 解析启动配置：顶层优先于 opts，缺省使用 SQLx 默认值；池大小和 Lua 队列只在顶层配置。
 ---@type LrustSqlDriverOptions
 local opts = conf.opts or {}
 local database_url = conf.url or conf.database_url or opts.url or opts.database_url
@@ -95,6 +104,8 @@ local accepting = true
 local shutdown_started = false
 local round_robin = 0
 
+--- 构造 driver 统一错误表；code 供客户端判断失败，kind 保留原始错误分类。
+--- message 转成字符串，未提供时使用 code；本函数只包装结果，不记录日志或发送响应。
 ---@param code LrustSqlDriverErrorCode
 ---@param message? any
 ---@param kind? string
@@ -107,6 +118,9 @@ local function error_result(code, message, kind)
     }
 end
 
+--- 把 SQLx 错误表转换为 driver 错误；无 kind 字段表示不是错误，返回 nil。
+--- DB/SOCKET/TIMEOUT/BUSY/CLOSED 保留对应 code，其余 SQLx 错误统一归为 DRIVER。
+--- 保留原 kind、sqlstate、constraint 等附加字段，便于业务区分数据库失败和驱动解码失败。
 ---@param res any
 ---@return LrustSqlDriverError?
 local function normalize_error(res)
@@ -137,6 +151,10 @@ local function normalize_error(res)
     return out
 end
 
+--- 按请求类别包装 SQLx 成功结果，保持 driver 客户端统一的返回结构。
+--- 查询：data 为行数组；执行/batch：data 为元数据，同时提升 rows_affected/last_insert_id。
+--- 事务：data=true，rows_affected 为累计值；num_queries 为事务长度，其余命令为 1。
+--- 只负责成功结构映射，调用者必须先排除错误；不会把 SQL NULL 转成 Lua nil。
 ---@param req LrustSqlDriverRequest
 ---@param res any 已成功的 SQLx 协议载荷，由 req.command 决定具体结构。
 ---@return LrustSqlDriverQueryResult|LrustSqlDriverExecuteResult|LrustSqlDriverTransactionResult
@@ -165,6 +183,8 @@ local function normalize_success(req, res)
     }
 end
 
+--- 识别跨服务传来的 PG 数组普通标记，重建 SQLx 数组包装器。
+--- 其他值（包括 text/json/bytes/null 标记）原样交给 SQLx；此处不编码 JSON 或转换字段类型。
 ---@param value SqlXParam
 ---@return SqlXParam
 local function restore_param(value)
@@ -174,6 +194,10 @@ local function restore_param(value)
     return value
 end
 
+--- 按命令校验请求载荷，生成供 lane 工作协程使用的内部结构，尚不执行 SQL。
+--- 参数化命令保留显式 n，避免尾部 nil 在消息传递后丢失；逐个恢复数组标记。
+--- 事务逐条校验 SQL 和参数长度，完整准备后才允许入队；任意异常由 enqueue 返回 INVALID。
+--- 原始 query/execute/batch 只接收 SQL 字符串；SQL 片段及 buffer 应已在客户端转换。
 ---@param command LrustSqlDriverCommand
 ---@param sql string|SqlXStatement[]
 ---@param params? LrustSqlDriverPackedParams
@@ -217,12 +241,18 @@ local function prepare_payload(command, sql, params)
     return { queries = queries }
 end
 
+--- 计算本服务眼中的 lane 负载：Lua 等待队列长度，加当前处理中的请求（至多 1）。
+--- 当前请求的连接建立、执行和必要的关闭也计入 inflight；不查询 Rust 或数据库的全局负载。
+--- 该值同时用于最小负载路由、max_queue 准入检查以及客户端 len。
 ---@param ctx LrustSqlDriverLane
 ---@return integer count 排队与执行中请求总数。
 local function lane_load(ctx)
     return list.size(ctx.queue) + (ctx.inflight and 1 or 0)
 end
 
+--- 把业务路由 key 转成确定性整数；整数直接使用，字符串按字节计算哈希。
+--- 拒绝非整数数值及其他 Lua 类型；它不是加密哈希，不保证不同 key 不碰撞。
+--- 最终 lane 由 hash % poolsize + 1 决定，因此 key 不是 lane 编号，改变 poolsize 会改变映射。
 ---@param key LrustSqlDriverAffinity
 ---@return integer hash
 local function stable_hash(key)
@@ -240,6 +270,9 @@ local function stable_hash(key)
     return value
 end
 
+--- 选择当前负载最小的 lane；负载相同时按上次选择位置轮转，避免总选第一条。
+--- 只观察本服务队列，不考虑 SQL 成本或数据库锁等待；不建立连接，也不搬移已排队请求。
+--- 用于无亲和性请求，不能保证连续两次调用落到同一连接或按发送顺序执行。
 ---@return LrustSqlDriverLane
 local function least_loaded_lane()
     ---@type LrustSqlDriverLane|nil
@@ -259,6 +292,9 @@ local function least_loaded_lane()
     return best
 end
 
+--- 根据内部 affinity 选择 lane：false/nil 使用最小负载，整数/字符串使用固定哈希映射。
+--- 同一服务、同一 poolsize 和同一 key 始终选中同一 lane，不因当前负载高而改路。
+--- 客户端默认接口会把省略的 key 转成 1；只有显式 any 接口才传入 false。
 ---@param affinity LrustSqlDriverRoute
 ---@return LrustSqlDriverLane
 local function select_lane(affinity)
@@ -268,6 +304,9 @@ local function select_lane(affinity)
     return pool[stable_hash(affinity) % poolsize + 1]
 end
 
+--- 等待关闭当前 lane 持有的 SQLx 连接；没有句柄时直接返回。
+--- 关闭异常/失败仅记录日志，随后仍清空 ctx.db；此函数不重试关闭、不重放 SQL。
+--- 用于服务退出及连接故障后的清理；清空后下一条请求可按原连接名重新建立连接。
 ---@async
 ---@param ctx LrustSqlDriverLane
 local function close_lane(ctx)
@@ -284,6 +323,9 @@ local function close_lane(ctx)
     ctx.db = nil
 end
 
+--- 按 lane 专属名称建立 SQLx 连接，等待连接结果并应用统一的超时、行数和队列配置。
+--- 成功写入 ctx.db；失败返回规范化错误而不重试，由当前请求或启动流程决定如何处理。
+--- 用于启动预连接、首次惰性连接以及故障后的下一条请求；不是跨 lane 连接复用。
 ---@async
 ---@param ctx LrustSqlDriverLane
 ---@return SqlX? connection
@@ -302,6 +344,10 @@ local function connect_lane(ctx)
     return db
 end
 
+--- 在指定 lane 上执行一个已准备的请求；没有连接时先建立，连接失败则不提交本次 SQL。
+--- 即使客户端使用不等待接口，服务内部仍等待 SQLx 完成后才执行该 lane 的下一条请求。
+--- 参数化请求按显式 n 展开参数；事务整批提交给 SQLx，不拆成多个 lane 请求。
+--- SQLx 调用异常/无有效响应转为 DRIVER，正常响应按成功或错误结构包装；此处不自动重试。
 ---@async
 ---@param ctx LrustSqlDriverLane
 ---@param req LrustSqlDriverRequest
@@ -342,6 +388,9 @@ local function invoke(ctx, req)
     return normalize_error(res) or normalize_success(req, res)
 end
 
+--- 执行一次 lane 请求，并处理 SOCKET/TIMEOUT/CLOSED 后的连接清理。
+--- 这几类失败先等待 close_lane，再交回原错误；后续排队请求才尝试重连。
+--- 不会重新执行当前失败请求，因为响应丢失或超时不能证明数据库没有提交写入。
 ---@async
 ---@param ctx LrustSqlDriverLane
 ---@param req LrustSqlDriverRequest
@@ -356,6 +405,8 @@ local function execute_request(ctx, req)
     return res
 end
 
+--- 向等待调用者返回一次 driver 结果；session=0 表示不等待调用，只记录失败日志。
+--- 不等待请求成功时静默结束；此处不重试请求，也不修改结果结构。
 ---@param req LrustSqlDriverRequest
 ---@param res LrustSqlDriverResult
 local function finish_request(req, res)
@@ -373,6 +424,10 @@ local function finish_request(req, res)
     moon.response("lua", req.sender, req.session, res)
 end
 
+--- 确保每条 lane 至多有一个工作协程；已有协程时直接返回，不重复启动。
+--- 工作协程从 FIFO 队首取请求，等待执行及必要清理，再处理下一条；其他 lane 可独立推进。
+--- 未捕获的请求执行异常转换为 DRIVER 并清理连接；处理结果通过 finish_request 返回或记录。
+--- 队列暂时为空后释放 running 标记，之后的新请求可再次启动工作协程。
 ---@param ctx LrustSqlDriverLane
 local function start_worker(ctx)
     if ctx.running then
@@ -400,6 +455,8 @@ local function start_worker(ctx)
     end)
 end
 
+--- 处理尚未入队的请求拒绝：有 session 就回错误表，无 session 就记录日志。
+--- 用于关闭、参数非法、队列满或未知命令等情况；不访问数据库，不等待队列空位。
 ---@param sender integer
 ---@param session integer 0 表示只记录日志，不发送响应。
 ---@param res LrustSqlDriverError
@@ -411,6 +468,10 @@ local function reject(sender, session, res)
     end
 end
 
+--- 数据库请求的统一入口：检查接收状态、校验载荷、选择 lane，再检查该 lane 的容量。
+--- 关闭中返回 CLOSED，参数/路由非法返回 INVALID，达到 max_queue 返回 BUSY。
+--- max_queue 计算等待加当前请求，0 表示不限；固定 key 不会因目标 lane 满而转发到别处。
+--- 全部检查通过后才压入 FIFO 并确保工作协程启动；拒绝的请求不会执行部分 SQL。
 ---@param sender integer
 ---@param session integer
 ---@param command LrustSqlDriverCommand
@@ -453,6 +514,7 @@ local function enqueue(sender, session, command, affinity, sql, params)
     start_worker(ctx)
 end
 
+-- 先创建所有 lane 的 Lua 状态；这里尚未建立物理连接，也不启动工作协程。
 for i = 1, poolsize do
     pool[i] = {
         index = i,
@@ -466,6 +528,8 @@ for i = 1, poolsize do
     }
 end
 
+-- 默认启动时逐条建立连接；任意连接失败就清理已打开的连接并中止启动。
+-- eager_connect=false 时不预连，每条 lane 的第一条请求负责建立；启动成功不代表数据库可用。
 if conf.eager_connect ~= false then
     for _, ctx in ipairs(pool) do
         local _, err = connect_lane(ctx)
@@ -482,6 +546,9 @@ if conf.eager_connect ~= false then
     end
 end
 
+--- 构造服务及所有 lane 的状态快照，不执行数据库探活。
+--- queue 只含等待请求；inflight 表示当前正在处理请求，running 表示工作协程存活。
+--- connected 仅说明持有 Lua 连接对象，不能保证网络正常；统计不等待各 lane 排空。
 ---@return LrustSqlDriverStats
 local function stats()
     local result = {
@@ -501,7 +568,11 @@ local function stats()
     return result
 end
 
---- 停止接收请求并启动异步排空流程；此函数本身不等待退出。
+--- 启动幂等的优雅退出流程；立即停止接收新数据库请求，本函数本身不等待退出。
+--- 后台协程等所有 lane 已接收请求处理完，再依次尝试关闭连接，最后调用 moon.quit。
+--- 排空表示请求已处理，不代表每条 SQL 都成功；已有错误仍按原来的响应/日志规则处理。
+--- 关闭期间仍可在服务存活时读取 len/stats；重复关闭通知不会再启动第二次流程。
+--- 没有退出完成应答，也没有单独的排空总超时；应由外层服务管理逻辑确认退出。
 local function drain_and_quit()
     if shutdown_started then
         return
@@ -531,6 +602,8 @@ local function drain_and_quit()
     end)
 end
 
+-- 数据库命令统一入队；len/stats 直接读取快照，不等待队列中的 SQL。
+-- save_then_quit 仅发起退出流程，不回复完成应答；未知命令通过 reject 报告 COMMAND。
 moon.dispatch("lua", function(sender, session, command, affinity, sql, params)
     if command == "query" or command == "query_params"
         or command == "execute" or command == "execute_params" or command == "batch"
@@ -551,4 +624,5 @@ moon.dispatch("lua", function(sender, session, command, affinity, sql, params)
     end
 end)
 
+-- Moon 正常关闭通知与客户端关闭命令共用同一幂等排空流程；不能保证强制终止时也执行。
 moon.shutdown(drain_and_quit)
