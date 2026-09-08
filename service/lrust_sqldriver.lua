@@ -5,6 +5,8 @@
 --- 即使客户端不等待，服务端仍等待本次 SQLx 调用完成后才推进同一 lane，保证顺序。
 --- max_queue 限制本服务每条 lane 的等待加当前请求数；queue_capacity 是另一层的 Rust 队列容量。
 --- 连接失败不会重放当前 SQL；SOCKET/TIMEOUT/CLOSED 后清理连接，下一条请求再尝试建立。
+--- 建连失败按 lane 指数退避；冷却期间请求直接失败，不等待、不提交 SQL，也不自动重试。
+--- 超时只中断客户端等待，不保证数据库端旧 SQL 已停止；跨故障的业务顺序需额外数据库约束。
 --- 服务实例应使用不同 conf.name，避免相同底层连接名互相替换；不要从外部关闭或使用 lane 连接。
 --- 公开配置/返回类型定义在客户端模块中，本服务无需 require 客户端来执行。
 ---@type LrustSqlDriverConfig
@@ -45,6 +47,11 @@ local moon = require("moon")
 ---@field inflight boolean 是否正在处理一个请求，包含其连接建立、执行和必要清理。
 ---@field db? SqlX 当前连接对象；惰性连接未建立或故障清理后为 nil。
 ---@field connection_name string lane 专属进程内连接名，由服务名和 lane 索引组成。
+---@field reconnect_delay integer 本次建连失败的冷却毫秒数；成功建连后归零。
+---@field reconnect_at number 允许下次建连的单调时钟毫秒数。
+---@field connect_error? LrustSqlDriverError 最近一次建连错误，冷却响应保留其元数据。
+---@field next_connect_log number 下次可记录建连失败日志的单调时钟毫秒数。
+---@field suppressed_connect_logs integer 已抑制的建连失败日志数，下次日志汇总。
 
 --- 校验事务外层列表是从 1 开始的无空洞序列，返回语句数；空列表合法。
 --- 服务端独立校验，不信任客户端已做过检查；非法输入抛错，由入队阶段转换成 INVALID。
@@ -93,6 +100,17 @@ assert(max_rows and max_rows > 0, "lrust_sqldriver max_rows must be a positive i
 local queue_capacity = math.tointeger(conf.queue_capacity or opts.queue_capacity or 100)
 assert(queue_capacity and queue_capacity > 0,
     "lrust_sqldriver queue_capacity must be a positive integer")
+
+local reconnect_initial_delay = math.tointeger(conf.reconnect_initial_delay or opts.reconnect_initial_delay or 250)
+local reconnect_max_delay = math.tointeger(conf.reconnect_max_delay or opts.reconnect_max_delay or 5000)
+local reconnect_log_interval = math.tointeger(conf.reconnect_log_interval or opts.reconnect_log_interval or 5000)
+assert(reconnect_initial_delay and reconnect_initial_delay >= 0 and reconnect_initial_delay <= 0xFFFFFFFF,
+    "lrust_sqldriver reconnect_initial_delay must be between 0 and 4294967295")
+assert(reconnect_max_delay and reconnect_max_delay > 0 and reconnect_max_delay <= 0xFFFFFFFF
+    and reconnect_max_delay >= reconnect_initial_delay,
+    "lrust_sqldriver reconnect_max_delay must be positive and >= reconnect_initial_delay (max 4294967295)")
+assert(reconnect_log_interval and reconnect_log_interval >= 0 and reconnect_log_interval <= 0xFFFFFFFF,
+    "lrust_sqldriver reconnect_log_interval must be between 0 and 4294967295")
 
 local max_queue = math.tointeger(conf.max_queue or 0)
 assert(max_queue and max_queue >= 0,
@@ -305,41 +323,61 @@ local function select_lane(affinity)
 end
 
 --- 等待关闭当前 lane 持有的 SQLx 连接；没有句柄时直接返回。
---- 关闭异常/失败仅记录日志，随后仍清空 ctx.db；此函数不重试关闭、不重放 SQL。
+--- 先摘除 ctx.db 防止复用，再等待关闭；异常/失败仅记录日志，不重试关闭、不重放 SQL。
 --- 用于服务退出及连接故障后的清理；清空后下一条请求可按原连接名重新建立连接。
 ---@async
 ---@param ctx LrustSqlDriverLane
 local function close_lane(ctx)
-    if not ctx.db then
+    local db = ctx.db
+    ctx.db = nil
+    if not db then
         return
     end
-    local ok, closed, err = xpcall(ctx.db.close, traceback, ctx.db)
+    local ok, closed, err = xpcall(db.close, traceback, db)
     if not ok then
-        moon.error(string.format("lrust_sqldriver failed to close lane %d: %s", ctx.index, closed))
+        pcall(moon.error, string.format("lrust_sqldriver failed to close lane %d: %s", ctx.index, closed))
     elseif not closed then
-        moon.error(string.format("lrust_sqldriver failed to close lane %d: %s",
+        pcall(moon.error, string.format("lrust_sqldriver failed to close lane %d: %s",
             ctx.index, type(err) == "table" and err.message or tostring(err)))
     end
-    ctx.db = nil
 end
 
 --- 按 lane 专属名称建立 SQLx 连接，等待连接结果并应用统一的超时、行数和队列配置。
 --- 成功写入 ctx.db；失败返回规范化错误而不重试，由当前请求或启动流程决定如何处理。
 --- 用于启动预连接、首次惰性连接以及故障后的下一条请求；不是跨 lane 连接复用。
+--- 冷却中立即返回上次错误的副本和 retry_after_ms；只有实际建连失败才增加退避时间。
 ---@async
 ---@param ctx LrustSqlDriverLane
 ---@return SqlX? connection
 ---@return LrustSqlDriverError? err
 local function connect_lane(ctx)
+    local remaining = math.ceil(ctx.reconnect_at - moon.clock() * 1000)
+    if remaining > 0 and ctx.connect_error then
+        local err = {}
+        for key, value in pairs(ctx.connect_error) do err[key] = value end
+        err.retry_after_ms = remaining
+        return nil, err
+    end
     local db, err = sqlx.try_connect(database_url, ctx.connection_name, {
         connect_timeout = connect_timeout,
         request_timeout = request_timeout,
         max_rows = max_rows,
         queue_capacity = queue_capacity,
+        reconnect_initial_delay = reconnect_initial_delay,
+        reconnect_max_delay = reconnect_max_delay,
+        reconnect_log_interval = reconnect_log_interval,
     })
     if not db then
-        return nil, normalize_error(err) or error_result("DRIVER", "unknown SQLx connection error")
+        err = normalize_error(err) or error_result("DRIVER", "unknown SQLx connection error")
+        ctx.reconnect_delay = ctx.reconnect_delay == 0 and reconnect_initial_delay
+            or math.min(ctx.reconnect_delay * 2, reconnect_max_delay)
+        ctx.reconnect_at = moon.clock() * 1000 + ctx.reconnect_delay
+        err.connect_failed = true
+        err.retry_after_ms = ctx.reconnect_delay
+        ctx.connect_error = err
+        return nil, err
     end
+    ctx.reconnect_delay, ctx.reconnect_at, ctx.connect_error = 0, 0, nil
     ctx.db = db
     return db
 end
@@ -389,7 +427,9 @@ local function invoke(ctx, req)
 end
 
 --- 执行一次 lane 请求，并处理 SOCKET/TIMEOUT/CLOSED 后的连接清理。
---- 这几类失败先等待 close_lane，再交回原错误；后续排队请求才尝试重连。
+--- 非建连阶段的这几类失败先等待 close_lane，再交回原错误；后续排队请求才尝试重连。
+--- connect_failed 保留已有 actor 的退避状态，不销毁句柄；当前 SQL 在建连/冷却阶段未提交。
+--- Rust 在超时/连接故障响应前已丢弃旧连接，不会在此等待未完成 SQL 的协议清理。
 --- 不会重新执行当前失败请求，因为响应丢失或超时不能证明数据库没有提交写入。
 ---@async
 ---@param ctx LrustSqlDriverLane
@@ -397,7 +437,9 @@ end
 ---@return LrustSqlDriverResult
 local function execute_request(ctx, req)
     local res = invoke(ctx, req)
-    if res.code == "SOCKET" or res.code == "TIMEOUT" or res.code == "CLOSED" then
+    -- A live native actor owns its own reconnect cooldown. Do not destroy it
+    -- on a handshake error and accidentally reset that backoff on every call.
+    if not res.connect_failed and (res.code == "SOCKET" or res.code == "TIMEOUT" or res.code == "CLOSED") then
         close_lane(ctx)
     end
     -- Never replay a request automatically: after a lost response the server
@@ -406,27 +448,49 @@ local function execute_request(ctx, req)
 end
 
 --- 向等待调用者返回一次 driver 结果；session=0 表示不等待调用，只记录失败日志。
---- 不等待请求成功时静默结束；此处不重试请求，也不修改结果结构。
+--- 不等待请求成功时静默结束；NaN、过深表等无法跨服务打包时尝试返回简单 DRIVER 错误。
+--- 兜底响应也失败时只记日志，不能让响应异常阻断 lane；绝不重新执行 SQL。
+--- 只限速 session=0 的建连失败日志；普通 SQL 错误不合并，有 session 的错误逐条返回。
+---@param ctx LrustSqlDriverLane
 ---@param req LrustSqlDriverRequest
 ---@param res LrustSqlDriverResult
-local function finish_request(req, res)
+local function finish_request(ctx, req, res)
     if req.session == 0 then
         if res.code then
+            local suffix = ""
+            if res.connect_failed then
+                local now = moon.clock() * 1000
+                if now < ctx.next_connect_log then
+                    ctx.suppressed_connect_logs = ctx.suppressed_connect_logs + 1
+                    return
+                end
+                suffix = string.format("; suppressed connection errors: %d", ctx.suppressed_connect_logs)
+                ctx.next_connect_log = now + reconnect_log_interval
+                ctx.suppressed_connect_logs = 0
+            end
             moon.error(string.format(
-                "lrust_sqldriver %s failed on affinity '%s': [%s] %s",
+                "lrust_sqldriver %s failed on affinity '%s': [%s] %s%s",
                 req.command,
                 tostring(req.affinity),
                 tostring(res.code),
-                tostring(res.message)))
+                tostring(res.message), suffix))
         end
         return
     end
-    moon.response("lua", req.sender, req.session, res)
+    local ok, err = pcall(moon.response, "lua", req.sender, req.session, res)
+    if not ok then
+        local fallback = error_result("DRIVER", "failed to serialize/send SQLx result: " .. tostring(err))
+        local sent, send_err = pcall(moon.response, "lua", req.sender, req.session, fallback)
+        if not sent then
+            moon.error("lrust_sqldriver failed to send error response: " .. tostring(send_err))
+        end
+    end
 end
 
 --- 确保每条 lane 至多有一个工作协程；已有协程时直接返回，不重复启动。
 --- 工作协程从 FIFO 队首取请求，等待执行及必要清理，再处理下一条；其他 lane 可独立推进。
 --- 未捕获的请求执行异常转换为 DRIVER 并清理连接；处理结果通过 finish_request 返回或记录。
+--- 响应/日志异常也受保护，确保 inflight/running 复位并继续消费已排队请求。
 --- 队列暂时为空后释放 running 标记，之后的新请求可再次启动工作协程。
 ---@param ctx LrustSqlDriverLane
 local function start_worker(ctx)
@@ -448,8 +512,11 @@ local function start_worker(ctx)
                 res = error_result("DRIVER", res)
                 close_lane(ctx)
             end
-            finish_request(req, res)
+            local finished, finish_err = xpcall(finish_request, traceback, ctx, req, res)
             ctx.inflight = false
+            if not finished then
+                pcall(moon.error, "lrust_sqldriver response failed: " .. tostring(finish_err))
+            end
         end
         ctx.running = false
     end)
@@ -522,6 +589,10 @@ for i = 1, poolsize do
         running = false,
         inflight = false,
         db = nil,
+        reconnect_delay = 0,
+        reconnect_at = 0,
+        next_connect_log = 0,
+        suppressed_connect_logs = 0,
         -- Keep names stable across service restarts. lrust replaces a stale
         -- same-name handler, while each pool lane still has its own handle.
         connection_name = string.format("lrust_sqldriver:%s:%d", conf.name, i),

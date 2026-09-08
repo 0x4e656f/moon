@@ -34,6 +34,10 @@ local function positive_env(name, fallback)
     return value
 end
 local slow_ms = positive_env("SQLX_TEST_SLOW_MS", 300)
+-- Leave a generous scheduling margin, but keep the server-side sleep much
+-- longer so a close which waits for the old query is caught deterministically.
+local timeout_sleep_ms = math.max(4000, slow_ms * 8)
+local timeout_budget_ms = slow_ms + 1500
 local deadline_ms = positive_env("SQLX_TEST_DEADLINE_MS", 300000)
 local connection_options = { connect_timeout = 5000, request_timeout = 15000, max_rows = 1000, queue_capacity = 128 }
 local suffix = string.format("%d_%d_%06x", os.time(), moon.id, math.random(0, 0xffffff))
@@ -327,6 +331,30 @@ local function parameter_tests()
         for _ = 1, 30 do nested = { nested } end
         equal(row(admin:query("SELECT $1::JSONB AS value", sqlx.json(nested))).value, nested)
     end)
+    case("params/json-direct-conversion-compatibility", function()
+        local object = { ['quote"slash\\line\n'] = "escaped key", [""] = "empty key", nested = { false, null, 1.25 },
+            low = math.mininteger, high = math.maxinteger }
+        for _, typename in ipairs({ "JSON", "JSONB" }) do
+            equal(row(admin:query("SELECT $1::" .. typename .. " AS value", object)).value, object)
+            equal(row(admin:query("SELECT $1::" .. typename .. " AS value", sqlx.json(object))).value, object)
+            equal(row(admin:query("SELECT $1::" .. typename .. "[] AS value",
+                sqlx.array(typename:lower(), { object, null, false, "text" }))).value, { object, null, false, "text" })
+        end
+        equal(row(admin:query("SELECT jsonb_typeof($1::JSONB) AS value", {})).value, "array")
+        local sparse = { 1, 2, 3 }
+        sparse[2] = nil
+        equal(row(admin:query("SELECT $1::JSONB AS value", sparse)).value, { 1, null, 3 })
+        local numeric_keys = { [0] = "zero", [-2] = "negative", label = "object" }
+        equal(row(admin:query("SELECT $1::JSONB AS value", numeric_keys)).value,
+            { ["0"] = "zero", ["-2"] = "negative", label = "object" })
+        local depth = { leaf = true }
+        for _ = 1, 63 do depth = { depth } end
+        equal(row(admin:query("SELECT jsonb_typeof($1::JSONB) AS value", depth)).value, "array")
+        error_result(admin:query("SELECT $1::JSONB", { depth }), "ERROR", "64")
+        local cyclic = {}; cyclic.self = cyclic
+        error_result(admin:query("SELECT $1::JSONB", cyclic), "ERROR", "64")
+        equal(row(admin:query("SELECT 1 AS value")).value, 1, "connection survives depth/cycle errors")
+    end)
     for _, typename in ipairs({ "bool", "int2", "int4", "int8", "float4", "float8", "text", "bytea", "jsonb",
         "uuid", "date", "time", "timetz", "timestamp", "timestamptz" }) do
         case("params/typed-null/" .. typename, function()
@@ -339,6 +367,14 @@ local function parameter_tests()
         equal(row(admin:query("SELECT $1::TEXT AS value", sqlx.null())).value, null)
     end)
     local invalid = {
+        { "json-invalid-key-utf8", "SELECT $1::JSONB", { [string.char(255)] = true } },
+        { "json-invalid-value-utf8", "SELECT $1::JSONB", { value = string.char(255) } },
+        { "json-bool-key", "SELECT $1::JSONB", { [false] = 1 } },
+        { "json-fractional-key", "SELECT $1::JSONB", { [1.25] = 1 } },
+        { "json-nan", "SELECT $1::JSONB", { value = 0 / 0 } },
+        { "json-infinity", "SELECT $1::JSONB", sqlx.json({ value = math.huge }) },
+        { "json-function", "SELECT $1::JSONB", { value = function() end } },
+        { "json-array-invalid-value", "SELECT $1::JSONB[]", sqlx.array("jsonb", { { value = math.huge } }) },
         { "invalid-utf8", "SELECT $1::TEXT", string.char(255) },
         { "typed-invalid-utf8", "SELECT $1::TEXT", sqlx.text(string.char(255)) },
         { "function-param", "SELECT $1::TEXT", function() end },
@@ -445,6 +481,40 @@ local function operation_tests()
 end
 
 local function lifecycle_tests()
+    case("connection/persistent-session-and-statement-cache", function()
+        local db = open("persistent")
+        local pid = row(db:query("SELECT pg_backend_pid() AS pid")).pid
+        ok(db:batch("CREATE TEMP TABLE sqlx_session_probe(n BIGINT); INSERT INTO sqlx_session_probe VALUES(1)"))
+        for i = 1, 5 do
+            equal(row(db:query("SELECT $1::BIGINT AS n, pg_backend_pid() AS pid", i)), { n = i, pid = pid })
+        end
+        ok(db:execute_wait("UPDATE sqlx_session_probe SET n=n+1"))
+        ok(db:transaction({ { "UPDATE sqlx_session_probe SET n=n+1" } }))
+        equal(row(db:query("SELECT n FROM sqlx_session_probe")).n, 3)
+        equal(row(db:query("SELECT pg_backend_pid() AS pid")).pid, pid)
+        expect(row(db:query("SELECT count(*)::BIGINT AS n FROM pg_prepared_statements WHERE statement = $1",
+            "SELECT $1::BIGINT AS n, pg_backend_pid() AS pid")).n >= 1, "prepared statement was not cached")
+        close(db)
+    end)
+    case("transaction/error-releases-locks-before-next-request", function()
+        local db = open("rollback_locks")
+        local pid = row(db:query("SELECT pg_backend_pid() AS pid")).pid
+        error_result(db:transaction({
+            { "UPDATE " .. qualified .. "queue_gate SET n=n+1 WHERE id=1" },
+            { "SELECT 1/0" },
+        }), "DB")
+        wait_until(function()
+            return row(admin:query("SELECT state FROM pg_stat_activity WHERE pid=$1::BIGINT", pid)).state == "idle"
+        end, "failed transaction must finish ROLLBACK, not remain idle in transaction (aborted)", 1000)
+        -- The failed connection remains idle: another connection must be able
+        -- to take the lock without waiting for a future request to flush ROLLBACK.
+        ok(admin:transaction({
+            { "SET LOCAL lock_timeout = '1s'" },
+            { "SELECT * FROM " .. qualified .. "queue_gate WHERE id=1 FOR UPDATE" },
+        }))
+        equal(row(db:query("SELECT 42 AS n")).n, 42)
+        close(db)
+    end)
     case("connection/try-connect-numeric-options-and-url-alias", function()
         local db = open("try", 5000, nil, true)
         equal(row(db:query("SELECT 1 AS value")).value, 1); close(db)
@@ -453,13 +523,31 @@ local function lifecycle_tests()
         expect(alias, safe_message(err and err.message)); connections[#connections + 1] = alias
         equal(row(alias:query("SELECT 1 AS value")).value, 1); close(alias)
     end)
+    case("transaction/commit-error-discards-connection", function()
+        local db = open("commit_error")
+        local pid = row(db:query("SELECT pg_backend_pid() AS pid")).pid
+        ok(db:batch("CREATE TEMP TABLE sqlx_commit_probe(n BIGINT UNIQUE DEFERRABLE INITIALLY DEFERRED)"))
+        local err = error_result(db:transaction({ { "INSERT INTO sqlx_commit_probe VALUES(1),(1)" } }), "DB")
+        equal(err.sqlstate, "23505", "commit error metadata must be preserved")
+        expect(row(db:query("SELECT pg_backend_pid() AS pid")).pid ~= pid, "failed COMMIT connection was reused")
+        close(db)
+    end)
     case("connection/reject-invalid-options-and-url", function()
-        for _, key in ipairs({ "connect_timeout", "request_timeout", "max_rows", "queue_capacity" }) do
+        for _, key in ipairs({ "connect_timeout", "request_timeout", "max_rows", "queue_capacity", "reconnect_max_delay" }) do
             for _, value in ipairs({ 0, -1, math.maxinteger }) do
                 local db, err = sqlx.try_connect(url, schema .. ":invalid", { [key] = value })
                 equal(db, nil); error_result(err, "ERROR")
             end
         end
+        for _, key in ipairs({ "reconnect_initial_delay", "reconnect_log_interval" }) do
+            for _, value in ipairs({ -1, math.maxinteger }) do
+                local db, err = sqlx.try_connect(url, schema .. ":invalid", { [key] = value })
+                equal(db, nil); error_result(err, "ERROR")
+            end
+        end
+        local invalid_db, invalid_err = sqlx.try_connect(url, schema .. ":invalid",
+            { reconnect_initial_delay = 1001, reconnect_max_delay = 1000 })
+        equal(invalid_db, nil); error_result(invalid_err, "ERROR")
         local db, err = sqlx.try_connect("not-a-database-url", schema .. ":invalid")
         equal(db, nil); error_result(err)
         local success = pcall(sqlx.connect, "not-a-database-url", schema .. ":invalid")
@@ -467,20 +555,27 @@ local function lifecycle_tests()
     end)
     case("limits/max-rows-boundary-and-recovery", function()
         local db = open("max_rows", { max_rows = 3 })
+        local pid = row(db:query("SELECT pg_backend_pid() AS pid")).pid
         equal(#ok(db:query("SELECT generate_series(1,3) AS n")), 3)
         error_result(db:query("SELECT generate_series(1,4) AS n"), nil, "max_rows")
-        equal(row(db:query("SELECT 7 AS value")).value, 7); close(db)
+        local recovered = row(db:query("SELECT 7 AS value, pg_backend_pid() AS pid"))
+        equal(recovered.value, 7)
+        expect(recovered.pid ~= pid, "partially read connection was reused after max_rows")
+        close(db)
     end)
     for _, method in ipairs({ "query", "execute_wait", "batch", "transaction" }) do
         case("limits/request-timeout/" .. method, function()
             local db = open("timeout_" .. method, { request_timeout = slow_ms })
-            local statement = "SELECT pg_sleep(" .. tostring(slow_ms * 4 / 1000) .. ")"
+            local statement = "SELECT pg_sleep(" .. tostring(timeout_sleep_ms / 1000) .. ")"
+            local started = moon.clock()
             local result
             if method == "transaction" then
                 result = db:transaction({ { "INSERT INTO " .. qualified .. "events VALUES(30,'timeout rollback')" }, { statement } })
             else result = db[method](db, statement) end
             error_result(result, "TIMEOUT")
             close(db) -- No replay. A timed-out non-transactional write may have committed.
+            expect((moon.clock() - started) * 1000 < timeout_budget_ms,
+                "timeout/close waited for the cancelled database operation")
             if method == "transaction" then
                 wait_until(function()
                     return row(admin:query("SELECT count(*) AS n FROM " .. qualified .. "events WHERE id=30")).n == 0
@@ -488,6 +583,20 @@ local function lifecycle_tests()
             end
         end)
     end
+    case("limits/timeout-queued-request-reconnects-without-replay", function()
+        local db, name = open("timeout_queued", { request_timeout = slow_ms, queue_capacity = 2 })
+        local pid = row(db:query("SELECT pg_backend_pid() AS pid")).pid
+        local first = start_job(function()
+            return db:query("SELECT pg_sleep(" .. tostring(timeout_sleep_ms / 1000) .. ")")
+        end)
+        local second = start_job(function() return db:query("SELECT pg_backend_pid() AS pid") end)
+        equal(sqlx.stats()[name], 2, "requests were not queued before the timeout")
+        error_result(join(first), "TIMEOUT")
+        expect(row(join(second)).pid ~= pid, "queued request reused timed-out transport")
+        equal(sqlx.stats()[name], 0)
+        equal(row(db:query("SELECT 7 AS n")).n, 7)
+        close(db)
+    end)
     case("queue/busy-counter-and-no-replay", function()
         local db, name = open("busy", { queue_capacity = 1, request_timeout = 15000 })
         local pid = row(db:query("SELECT pg_backend_pid() AS pid")).pid
@@ -713,13 +822,29 @@ local function driver_tests()
         -- Sequence increments are visible even if the timed-out statement rolls
         -- back. This distinguishes one execution from accidental write replay.
         ok(admin:execute_wait("CREATE SEQUENCE " .. qualified .. "attempts START 1"))
+        local started = moon.clock()
         local err = driver.query(timed, "SELECT nextval('" .. schema .. ".attempts') AS attempt, pg_sleep("
-            .. tostring(slow_ms * 4 / 1000) .. ") AS pause")
+            .. tostring(timeout_sleep_ms / 1000) .. ") AS pause")
         equal(error_result(err, "TIMEOUT").code, "TIMEOUT")
+        expect((moon.clock() - started) * 1000 < timeout_budget_ms, "driver TIMEOUT waited for connection cleanup")
         local next_pid = driver_row(driver.query(timed, "SELECT pg_backend_pid() AS pid")).pid
         expect(next_pid ~= pid, "driver failed to recreate timed-out connection")
         equal(row(admin:query("SELECT last_value, is_called FROM " .. qualified .. "attempts")),
             { last_value = 1, is_called = true }, "timed-out statement must execute once, without replay")
+        stop_driver(rec)
+    end)
+    case("driver/unserializable-result-does-not-stall-lane", function()
+        local tested, rec = new_driver("serialization", { poolsize = 1 })
+        for _, statement in ipairs({
+            "SELECT 'NaN'::FLOAT8 AS value",
+            [[SELECT (repeat('[', 40) || '1' || repeat(']', 40))::JSONB AS value]],
+        }) do
+            local err = driver.query(tested, statement)
+            equal(error_result(err, "DRIVER", "serialize/send").code, "DRIVER")
+            equal(driver_row(driver.query(tested, "SELECT 42 AS value")).value, 42)
+            local lane = driver.stats(tested).lanes[1]
+            expect(not lane.running and not lane.inflight and lane.queue == 0, "driver lane remained stuck")
+        end
         stop_driver(rec)
     end)
     case("driver/save-then-quit", function() stop_driver(record) end)

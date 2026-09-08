@@ -10,6 +10,9 @@
 --- 本模块原样透传 moon.call；服务不可达或等待被中断等 Moon 层失败不保证是上述错误表。
 --- @async 接口需要在可挂起的 Moon 协程中调用；不等待接口的返回不代表请求入队或数据库提交成功。
 --- request_timeout 不包含 driver/Rust 队列等待，也不是 moon.call 的总等待期限；SQL 不自动重放。
+--- 超时/断线不会等待旧 SQL 执行结束才返回，数据库端仍可能执行；跨故障的业务顺序不能仅靠 lane。
+--- 无法跨服务打包的结果（如 NaN 或过深 JSON）返回 DRIVER，lane 继续处理后续请求。
+--- 建连失败按 lane 指数退避，冷却期间请求直接返回 connect_failed/retry_after_ms，未提交 SQL。
 --- 所有字段解码和绑定限制沿用 ext.sqlx；当前 NUMERIC 原生解码尚不支持，并未自动转为字符串。
 local moon = require("moon")
 local buffer = require("buffer")
@@ -37,6 +40,9 @@ local tpack = table.pack
 ---@field request_timeout? integer Rust 开始执行后的超时，毫秒，默认 30000；不含两层队列等待，事务/batch 按整个请求计时。
 ---@field max_rows? integer 每次查询的最大行数，默认 100000；超过后返回错误，不是分页或截断返回。
 ---@field queue_capacity? integer 每个 Rust 连接的等待队列容量，默认 100；不是 driver 的 max_queue。
+---@field reconnect_initial_delay? integer 首次建连失败后的冷却毫秒数，默认 250；连续失败翻倍，0 禁用退避。
+---@field reconnect_max_delay? integer 冷却上限毫秒数，默认 5000；正整数且不小于 reconnect_initial_delay，成功建连后重置。
+---@field reconnect_log_interval? integer 不等待调用的建连失败日志间隔，毫秒，默认 5000；0 不限速，不影响普通 SQL 错误。
 ---@field max_queue? integer 每条 driver lane 的排队加执行中请求上限；默认 0 表示不限。
 ---@field eager_connect? boolean 默认 true，启动时建立全部连接，失败则中止启动；false 由各 lane 第一条请求按需建立。
 
@@ -45,6 +51,8 @@ local tpack = table.pack
 ---@field n? integer table.pack 的总长度（包含 SQL）；存在尾部 nil 时必须保留。
 
 ---@class LrustSqlDriverError
+---@field connect_failed? boolean true 表示本次建连/冷却失败，SQL 未提交；普通 SQL 错误、断线、执行超时不能据此推断提交状态。
+---@field retry_after_ms? integer 本 lane/连接的剩余冷却毫秒数；到期不代表数据库恢复，也不会自动重试。
 ---@field code LrustSqlDriverErrorCode 业务先检查此字段；错误不会自动重放。
 ---@field kind string 原始 SQLx 错误类别，或 driver 自身的错误类别。
 ---@field message string 错误说明；TIMEOUT/SOCKET 不保证写入未提交。
@@ -298,6 +306,7 @@ end
 --- 字符串是 JSON 字符串值，不会解析成原始 JSON 文档；已有 JSON 文本应先解码成 Lua 值。
 --- nil/json.null 表示 JSON null；SQL NULL 应使用 driver.null("jsonb")。
 --- 构造时不深拷贝或编码 table；随请求跨服务传递后，由 SQLx 编码并报告非法值。
+--- 空 table 为 []；对象键限 UTF-8 字符串/整数，数值必须有限。还需遵守 Moon 跨服务序列化深度限制。
 ---@param value SqlXJsonValue 待编码的 Lua 值；nil/json.null 表示 JSON null。
 ---@return SqlXJsonParam param
 function client.json(value)

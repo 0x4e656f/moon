@@ -10,6 +10,7 @@
 
 - 使用 **PostgreSQL 14+ 的专用测试数据库**，不要连接生产库。14+ 用于 multirange 类型用例。
 - 测试账号需要在这个数据库中创建 schema，以及在自己的 schema 中建表、类型、域和序列的权限。不需要超级用户，也不会终止其他数据库会话。
+- 连接复用/提交失败用例还需要数据库的 TEMP 权限，用于本次连接内的临时表；关闭连接时自动清理。
 - Moon 工作目录必须是仓库根目录；已配套部署 `clib/rust.dll` 和 `lualib/ext/sqlx.lua`。driver 服务在 `service/lrust_sqldriver.lua`，客户端在 `lualib/lrust_sqldriver/client.lua`，两份都需部署。
 - SQLx 协议号 23 不能被其他模块占用。
 - 默认使用 4 个 Moon 工作线程，单独启动测试进程。脚本结束会调用 `moon.exit`，不要作为业务进程中的普通服务启动。
@@ -41,7 +42,7 @@ SQLx 包装层及 driver 拆分的模拟回归检查（同样不启动 Moon、�
 premake5 --file=ext/lrust/test/sqlx_wrapper_check.lua check_sqlx
 ```
 
-此检查覆盖客户端独立导入、服务配置校验、客户端请求转发、服务消息分发、参数校验、延迟连接和关闭；不代替真实数据库及并发测试。
+此检查覆盖客户端独立导入、服务配置校验、客户端请求转发、服务消息分发、参数校验、延迟连接和关闭；还用协程模拟验证 NaN/过深结果的错误响应、兜底发送/日志失败后 FIFO 继续处理及退出。模拟检查不代替真实数据库及并发测试。
 
 ## 覆盖范围
 
@@ -53,12 +54,14 @@ premake5 --file=ext/lrust/test/sqlx_wrapper_check.lua check_sqlx
 | 其他 PG 字段 | 38 种 CAST-only 用例：NUMERIC/DECIMAL/MONEY、INTERVAL、BIT/VARBIT、网络地址、几何类型、range/multirange、XML、全文搜索、OID、PG_LSN、部分非原生数组；另测自定义 ENUM、DOMAIN、复合类型 |
 | 数据精度 | 有符号 64 位整数上下界、32/64 位浮点、NaN/Infinity、中文与引号、含 NUL/非法 UTF-8 字节的 BYTEA、微秒、时区和跨日转换 |
 | 参数 | 普通 bool/integer/number/string/table、text/json/bytes/null/array 包装、裸 nil、json.null、尾部 nil、JSON 标量/对象/数组/嵌套、SQL NULL 与 JSON null 区分 |
+| JSON 直接转换回归 | JSON/JSONB 标量和数组中的带引号/反斜杠/换行/空对象键、64 位整数、空表、稀疏数组、整数对象键、64/65 层深度边界、循环表、非法 UTF-8/对象键/NaN/Infinity/函数，拒绝后连接仍可用 |
 | SQLx 接口 | connect、try_connect、find_connection、stats、query、execute、execute_wait、batch、execute_batch、transaction、execute_transaction、close，以及参数辅助函数 |
 | 事务 | 提交、整笔回滚、空事务、影响行数、table.pack 保留尾部 nil、拒绝稀疏/非法语句列表且不产生部分写入 |
 | 错误与边界 | SQLSTATE/约束名/表名、语法错误、缺少参数、重复列名、非法 UTF-8/数组类型/数组元素/整数溢出、非法连接选项、max_rows 边界、查询/写入/batch/事务超时 |
 | 生命周期 | 队列满返回 BUSY、计数恢复、同名连接替换、重复 close、多个共享句柄同时 close、满队列关闭并排空、关闭后 CLOSED、最后句柄 GC、非法响应令牌 |
 | 跨服务 | 命名连接查找、并发响应归属、NULL/二进制/JSON/所有支持数组的序列化传递；字段结果也通过新 driver 检查 |
 | 新 driver | 全部公开路由接口及 pipe 别名、返回格式、池大小、物理连接、默认 key=1、整数/string key、同 key FIFO、独立 lane 和 any 路由、len/stats、延迟连接、max_queue、超时重连不重放、停止接收并排空退出 |
+| 连接复用优化回归 | 正常查询/写入/batch/事务保持后端 PID 与临时表、语句缓存、事务报错后立即回滚并释放锁、max_rows 后重建连接、超时后排队请求换连接执行、超时及关闭耗时上限、driver 无法序列化结果后继续处理与退出 |
 
 “全部类型”指当前 SQLx 明确支持解码的 PG 类型及上述边界覆盖，**不代表 SQLx 原生支持全部 PostgreSQL 内建/扩展/自定义类型**。
 
@@ -86,7 +89,7 @@ Remove-Item Env:SQLX_TEST_KEEP_DATA
 
 只测 `ext.sqlx`，跳过 driver 集成：`$env:SQLX_TEST_DRIVER = '0'`。该分组会明确计入 SKIP。
 
-默认单请求超时测试阈值为 300ms，故意执行四倍时长的 `pg_sleep`。远程/繁忙数据库可增大：
+默认单请求超时测试阈值为 300ms，故意执行 `max(4000ms, 阈值 × 8)` 的 `pg_sleep`。超时响应/关闭应在 `阈值 + 1500ms` 内完成，用于捕获等待旧 SQL 执行结束的回归，不是性能压测。远程/繁忙数据库可增大：
 
 ```powershell
 $env:SQLX_TEST_SLOW_MS = '1000'
@@ -98,5 +101,7 @@ $env:SQLX_TEST_DEADLINE_MS = '600000'
 ## 尚需专门故障注入的项目
 
 这套用例不关闭数据库、不杀后端、不改网络，也不测试其他数据库模块。真实断网、数据库重启、连接阶段网络超时、服务异常死亡后的 5–6 分钟响应回收、超过 5 分钟不消费响应、大规模内存/压力测试仍应在专门环境中验证。
+
+建连退避使用独立的无数据库检查：`premake5 --file=ext/lrust/test/sqlx_wrapper_check.lua check_sqlx` 通过可控时钟模拟验证冷却快速失败、翻倍/封顶/成功重置、lane 隔离、错误元数据、日志限速、关闭和 0 禁用选项；`ext/lrust/test/sqlx_retry_check.rs` 验证 Rust 退避/日志门控纯逻辑。它们不替代真实故障注入。退避仅针对建连失败，不改变普通 SQL 超时后的现有回归预期。
 
 超时不代表写入没有提交。测试通过序列记录超时请求尝试次数，检查 driver 不自动重放；业务仍要自己处理结果不确定性。
