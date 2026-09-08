@@ -10,7 +10,7 @@
 
 - 使用 **PostgreSQL 14+ 的专用测试数据库**，不要连接生产库。14+ 用于 multirange 类型用例。
 - 测试账号需要在这个数据库中创建 schema，以及在自己的 schema 中建表、类型、域和序列的权限。不需要超级用户，也不会终止其他数据库会话。
-- Moon 工作目录必须是仓库根目录；已配套部署 `clib/rust.dll` 和 `lualib/ext/sqlx.lua`，新 driver 在 `service/lrust_sqldriver.lua`。
+- Moon 工作目录必须是仓库根目录；已配套部署 `clib/rust.dll` 和 `lualib/ext/sqlx.lua`。driver 服务在 `service/lrust_sqldriver.lua`，客户端在 `lualib/lrust_sqldriver/client.lua`，两份都需部署。
 - SQLx 协议号 23 不能被其他模块占用。
 - 默认使用 4 个 Moon 工作线程，单独启动测试进程。脚本结束会调用 `moon.exit`，不要作为业务进程中的普通服务启动。
 
@@ -32,6 +32,16 @@ premake5 --file=example/check_sqlx_pg.lua check_sqlx_pg
 
 这个检查只加载专用检查脚本，不加载根目录 `premake5.lua`，不会构建、更新或切换 Git 分支。
 **语法检查通过不代表数据库测试通过。**
+
+driver 已拆分为服务与客户端模块。客户端统一使用 `require("lrust_sqldriver.client")`，不再兼容旧的 `require("lrust_sqldriver")`。服务启动仍然使用 `file = "lrust_sqldriver.lua"`，不会新增服务。
+
+SQLx 包装层及 driver 拆分的模拟回归检查（同样不启动 Moon、不连接数据库）：
+
+```powershell
+premake5 --file=ext/lrust/test/sqlx_wrapper_check.lua check_sqlx
+```
+
+此检查覆盖客户端独立导入、服务配置校验、客户端请求转发、服务消息分发、参数校验、延迟连接和关闭；不代替真实数据库及并发测试。
 
 ## 覆盖范围
 

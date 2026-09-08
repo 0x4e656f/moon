@@ -7,7 +7,7 @@ end
 local moon = require("moon")
 local sqlx = require("ext.sqlx")
 local json = require("json")
-local driver = require("lrust_sqldriver")
+local driver = require("lrust_sqldriver.client")
 local startup = ...
 local self_file = debug.getinfo(1, "S").source:sub(2)
 

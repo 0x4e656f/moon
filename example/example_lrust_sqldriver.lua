@@ -1,5 +1,6 @@
 local moon = require("moon")
-local dbclient = require("lrust_sqldriver")
+-- Client API only; start the service separately with moon.new_service.
+local dbclient = require("lrust_sqldriver.client")
 
 local startup = ...
 local database_url = type(startup) == "table" and startup.url or os.getenv("DATABASE_URL")

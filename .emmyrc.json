@@ -43,12 +43,12 @@
     },
     "workspace": {
       "ignoreDir": [
-  
+        
       ],
       "ignoreGlobs": [
       ],
       "library": [
-        "G:\\Git\\magic-tower2\\Client\\Assets\\.API"
+       
       ],
       "workspaceRoots": [],
       "encoding": "",

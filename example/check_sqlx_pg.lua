@@ -46,7 +46,8 @@ assert(#catalog.text_only == 38, "update coverage count if the cast catalog chan
 -- A name/reference check catches public API additions omitted from this suite.
 -- This is not a substitute for running assertions against PostgreSQL.
 local _, wrapper_source = compile("../lualib/ext/sqlx.lua")
-local _, driver_source = compile("../service/lrust_sqldriver.lua")
+compile("../service/lrust_sqldriver.lua")
+local _, driver_source = compile("../lualib/lrust_sqldriver/client.lua")
 local combined = test_source .. catalog_source
 local api_count = 0
 for name in wrapper_source:gmatch("function M[%.:]([%w_]+)%(") do
