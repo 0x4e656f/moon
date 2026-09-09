@@ -237,6 +237,21 @@ local function field_tests()
         local value = row(admin:query("INSERT INTO " .. qualified .. "generated_values DEFAULT VALUES RETURNING *"))
         equal(value, { a = 1, b = 1, c = 1, d = 1 })
     end)
+    case("field/temporal-special-and-range", function()
+        local value = row(admin:query([[SELECT
+            'infinity'::DATE AS date_pos, '-infinity'::DATE AS date_neg,
+            'infinity'::TIMESTAMP AS ts_pos, '-infinity'::TIMESTAMPTZ AS tz_neg,
+            '24:00:00'::TIME AS end_time, '24:00:00+05:30'::TIMETZ AS end_zone,
+            '5874897-12-31'::DATE AS far_date,
+            '294276-12-31 23:59:59.999999'::TIMESTAMP AS far_timestamp,
+            '0001-01-01 BC'::DATE AS bc_date]]))
+        equal(value, { date_pos = "infinity", date_neg = "-infinity", ts_pos = "infinity", tz_neg = "-infinity",
+            end_time = "24:00:00", end_zone = "24:00:00+05:30", far_date = "+5874897-12-31",
+            far_timestamp = "+294276-12-31 23:59:59.999999", bc_date = "0000-01-01" })
+        equal(row(admin:query("SELECT 42 AS value")).value, 42)
+        local responses = sqlx.response_stats()
+        expect(responses.waiting >= 0 and responses.ready >= 0, "invalid response counts")
+    end)
     case("field/all-columns-in-one-row", function()
         local value = row(admin:query("SELECT * FROM " .. qualified .. "scalar_values WHERE id = 1"))
         for _, spec in ipairs(catalog.fields) do equal(value["c_" .. spec.name], spec.expected, spec.name, spec.epsilon) end
