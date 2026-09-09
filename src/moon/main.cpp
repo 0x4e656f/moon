@@ -338,6 +338,7 @@ void open_custom_libs(lua_State* L) {
     //core
     REGISTER_CUSTOM_LIBRARY("moon.core", luaopen_moon_core);
     REGISTER_CUSTOM_LIBRARY("asio.core", luaopen_asio_core);
+    REGISTER_CUSTOM_LIBRARY("libpq.core", luaopen_libpq_core);
     REGISTER_CUSTOM_LIBRARY("sharetable.core", luaopen_sharetable_core);
     REGISTER_CUSTOM_LIBRARY("socket.core", luaopen_socket_core);
     REGISTER_CUSTOM_LIBRARY("http.core", luaopen_http_core);
