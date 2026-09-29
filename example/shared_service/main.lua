@@ -33,9 +33,26 @@ moon.async(function()
         local added, count = moon.call("lua", alice, "Player_Inventory.add_item", "potion", 2)
         assert(added and count == 2)
 
-        local updated, update_err = moon.call("lua", alice, "__hotfix",
-            inventory_file, "Player_Inventory_v2.lua")
-        assert(updated, update_err)
+        local updated, results = moon.call("lua", alice, "__hotfix", {
+            { name = player_file, updatename = "Player_v2.lua" },
+            { name = inventory_file, updatename = "Player_Inventory_v2.lua" },
+        })
+        if not updated then
+            if type(results) == "table" then
+                for _, result in ipairs(results) do
+                    if not result.ok then
+                        error(result.name .. ": " .. result.error)
+                    end
+                end
+            end
+            error(tostring(results))
+        end
+
+        local updated_name_ok, updated_name = moon.call("lua", alice, "Player.get_name")
+        assert(updated_name_ok and updated_name == "Alice (updated)")
+
+        local bob_name_ok, bob_name = moon.call("lua", bob, "Player.get_name")
+        assert(bob_name_ok and bob_name == "Bob")
 
         local added_again, new_count = moon.call("lua", alice, "Player_Inventory.add_item", "potion", 3)
         assert(added_again and new_count == 8) -- Same service state, updated method.
@@ -46,7 +63,7 @@ moon.async(function()
         local read_ok, final_count = moon.call("lua", alice, "Player_Inventory.get_item_count", "potion")
         assert(read_ok and final_count == 8)
 
-        print("shared service and Player inventory hotfix: OK")
+        print("shared service batch hotfix: OK")
         moon.kill(alice)
         moon.kill(bob)
     end, debug.traceback)

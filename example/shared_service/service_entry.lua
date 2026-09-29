@@ -55,6 +55,28 @@ end
 moon.dispatch("lua", function(sender, session, command, ...)
     if command == "__hotfix" then
         local path, replacement = ...
+        if type(path) == "table" then
+            for _, entry in ipairs(path) do
+                local name = type(entry) == "table" and (entry.name or entry[1]) or entry
+                if type(name) == "string" and not registered[name] then
+                    moon.response("lua", sender, session, false, "module is not registered: " .. name)
+                    return
+                end
+            end
+            local called, ok, results = pcall(hotfix.update_batch, path)
+            if not called then
+                moon.response("lua", sender, session, false, ok)
+            elseif type(results) == "string" then
+                moon.response("lua", sender, session, false, results)
+            else
+                local statuses = {}
+                for i, result in ipairs(results) do
+                    statuses[i] = { name = result.name, ok = result.ok, error = result.error }
+                end
+                moon.response("lua", sender, session, ok, statuses)
+            end
+            return
+        end
         if not registered[path] then
             moon.response("lua", sender, session, false, "module is not registered: " .. tostring(path))
             return

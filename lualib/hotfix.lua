@@ -993,7 +993,7 @@ function hotfix.update(name, updatename)
 	-- We need names to add them to the module table (module.new_func = ...)
 	if #newfuncs > 0 then
 		local module_name = name:match("([^/]+)%.lua$") or name
-		local parsed_funcs, parse_err = hotfix.parse_module_functions(name, module_name)
+		local parsed_funcs, parse_err = hotfix.parse_module_functions(updatename, module_name)
 		if not parsed_funcs then
 			return false, "Cannot parse source file: " .. (parse_err or "unknown error")
 		end
@@ -1094,6 +1094,66 @@ function hotfix.update(name, updatename)
 	end
 
 	return true, _LOADED[name]
+end
+
+-- Update several modules in order. Every entry is a module path, or a table
+-- containing { name, updatename } (also accepted as named fields). Validate
+-- the entire request before changing any module. An update failure does not
+-- roll back earlier successes; results report the outcome of every entry.
+function hotfix.update_batch(updates)
+	if type(updates) ~= "table" then
+		return false, "updates must be a non-empty array"
+	end
+	local count = 0
+	for key in pairs(updates) do
+		if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+			return false, "updates must be an array without named keys"
+		end
+		count = count + 1
+	end
+	if count == 0 then
+		return false, "updates must be a non-empty array"
+	end
+
+	local requests = {}
+	local seen = {}
+	for i = 1, count do
+		local entry = updates[i]
+		local name, updatename
+		if type(entry) == "string" then
+			name = entry
+		elseif type(entry) == "table" then
+			name = entry.name or entry[1]
+			updatename = entry.updatename or entry[2]
+		end
+		if type(name) ~= "string" or name == "" or
+			(updatename ~= nil and (type(updatename) ~= "string" or updatename == "")) then
+			return false, string.format("invalid update at index %d", i)
+		end
+		if seen[name] then
+			return false, "duplicate module in batch: " .. name
+		end
+		seen[name] = true
+		requests[i] = { name = name, updatename = updatename }
+	end
+
+	local all_ok = true
+	local results = {}
+	for i, request in ipairs(requests) do
+		local called, ok, value = pcall(hotfix.update, request.name, request.updatename)
+		if not called then
+			value, ok = ok, false
+		end
+		local result = { name = request.name, ok = ok }
+		if ok then
+			result.module = value
+		else
+			result.error = tostring(value)
+			all_ok = false
+		end
+		results[i] = result
+	end
+	return all_ok, results
 end
 
 return hotfix
