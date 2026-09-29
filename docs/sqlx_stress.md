@@ -1,5 +1,7 @@
 # SQLx / PostgreSQL 持续压测
 
+需要约 5 分钟的连接数、direct/driver 和资源对照时，使用独立的 [SQLx 五分钟性能诊断](sqlx_diagnostic.md)。原持续压测配置和行为保持不变。
+
 入口：`example/stress_sqlx_pg.lua`。唯一配置文件：`example/sqlx_stress/config.lua`。
 
 只测当前 SQLx 方案，默认经过 `lrust_sqldriver.client → service → lane 连接池`，不加载 libpq。也可选择直接调用 `ext.sqlx`。复用之前 PG 对比测试的 SQL、类型校验、直方图和 API 适配，不修改原有对比测试配置或业务模块。

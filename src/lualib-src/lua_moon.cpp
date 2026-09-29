@@ -192,7 +192,16 @@ static void table_tostring(std::string& res, lua_State* L, int index) {
     res.append("{");
     lua_pushnil(L);
     while (lua_next(L, index)) {
-        res.append(lua_tostring_unchecked(L, -2));
+        if (lua_type(L, -2) == LUA_TNUMBER) {
+            // Keep the lua_next key untouched while formatting array indexes.
+            res.append("[");
+            lua_pushvalue(L, -2);
+            res.append(lua_tostring_unchecked(L, -1));
+            lua_pop(L, 1);
+            res.append("]");
+        } else {
+            res.append(lua_tostring_unchecked(L, -2));
+        }
         res.append("=");
         switch (lua_type(L, -1)) {
             case LUA_TNUMBER: {
