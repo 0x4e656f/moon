@@ -51,6 +51,7 @@ local tpack = table.pack
 ---@field n? integer table.pack 的总长度（包含 SQL）；存在尾部 nil 时必须保留。
 
 ---@class LrustSqlDriverError
+---@field not_executed? boolean 仅 true 表示本次业务 SQL 均未执行（例如 BEGIN 失败）；可能已执行 SQL 或 COMMIT 时不设置。
 ---@field connect_failed? boolean true 表示本次建连/冷却失败，SQL 未提交；普通 SQL 错误、断线、执行超时不能据此推断提交状态。
 ---@field retry_after_ms? integer 本 lane/连接的剩余冷却毫秒数；到期不代表数据库恢复，也不会自动重试。
 ---@field code LrustSqlDriverErrorCode 业务先检查此字段；错误不会自动重放。
